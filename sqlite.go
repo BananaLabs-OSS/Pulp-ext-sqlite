@@ -136,6 +136,14 @@ func (m *sqliteManager) openForCell(cellID string) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
+		// Checkpoint the WAL into the main DB file after (essentially) every
+		// commit. Without this, low-write cell DBs never reach SQLite's default
+		// 1000-page auto-checkpoint threshold, so all data lives only in the
+		// -wal sidecar until db.Close() — which the host's window-close
+		// os.Exit(0) skips, silently losing data on the next run. Cost is
+		// negligible for these small stores.
+		"PRAGMA wal_autocheckpoint=1",
+		"PRAGMA synchronous=NORMAL",
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA busy_timeout=5000",
 	} {
