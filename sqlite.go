@@ -238,12 +238,12 @@ func sqliteExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pP
 	}
 	var out ExecResult
 	if ra, raErr := res.RowsAffected(); raErr != nil {
-		slog.Default().Warn("sqlite: RowsAffected failed", "err", raErr)
+		manager.logger.Warn("sqlite: RowsAffected failed", "err", raErr)
 	} else {
 		out.RowsAffected = ra
 	}
 	if lid, lidErr := res.LastInsertId(); lidErr != nil {
-		slog.Default().Warn("sqlite: LastInsertId failed", "err", lidErr)
+		manager.logger.Warn("sqlite: LastInsertId failed", "err", lidErr)
 	} else {
 		out.LastInsertID = lid
 	}
