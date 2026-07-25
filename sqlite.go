@@ -36,22 +36,56 @@ import (
 // empty there — see Pulp run.Main) so the DBs are opened lazily on
 // first Register with the manifest's cell name baked in.
 type sqliteManager struct {
-	mu          sync.RWMutex
-	dbs         map[string]*sql.DB
+	mu    sync.RWMutex
+	dbs   map[ext.ResourceKey]*sql.DB
+	slots *ext.ScopedFactory[*sqliteSlot]
+	// setups is keyed by application placement, rather than being process
+	// global. One host loads this extension for every application it
+	// supervises, so a later Setup must never redirect an already-bound cell.
+	setups      map[sqliteApplicationKey]sqliteSetup
 	storageRoot string
 	logger      *slog.Logger
 }
 
-var manager = &sqliteManager{dbs: map[string]*sql.DB{}}
+type sqliteApplicationKey struct {
+	applicationID string
+	instanceID    string
+}
+
+type sqliteSetup struct {
+	storageRoot string
+	logger      *slog.Logger
+}
+
+// sqliteSlot is retained by ext.ScopedFactory for one ResourceKey. Closing a
+// database clears the slot, allowing the same application/cell instance to
+// restart with a fresh *sql.DB while preserving the ownership namespace.
+type sqliteSlot struct {
+	mu sync.Mutex
+	db *sql.DB
+}
+
+func newSQLiteManager() *sqliteManager {
+	return &sqliteManager{
+		dbs:    map[ext.ResourceKey]*sql.DB{},
+		setups: map[sqliteApplicationKey]sqliteSetup{},
+		slots: ext.NewScopedFactory(func(ext.ResourceKey) (*sqliteSlot, error) {
+			return &sqliteSlot{}, nil
+		}),
+	}
+}
+
+var manager = newSQLiteManager()
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:         "storage.sqlite",
-		Setup:        setup,
-		Teardown:     teardown,
-		Register:     bindActive,
-		Stub:         bindStub,
-		TeardownCell: teardownCell,
+		Name:          "storage.sqlite",
+		Setup:         setup,
+		Teardown:      teardown,
+		TeardownScope: teardownScope,
+		Register:      bindActive,
+		Stub:          bindStub,
+		TeardownCell:  teardownCell,
 	})
 }
 
@@ -60,47 +94,169 @@ func init() {
 // here would collide across cells. Databases are opened lazily from
 // Register() once the cell identity is known.
 func setup(env ext.SetupEnv) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	manager.storageRoot = env.StorageRoot
-	manager.logger = env.Logger
-	if manager.logger == nil {
-		manager.logger = slog.Default()
+	return manager.setup(env)
+}
+
+func (m *sqliteManager) setup(env ext.SetupEnv) error {
+	scope := env.EffectiveScope()
+	if err := validateFilesystemScope(scope); err != nil {
+		return err
 	}
-	manager.logger.Info("storage.sqlite setup", "storage_root", env.StorageRoot)
+	logger := env.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	appKey := sqliteApplicationScopeKey(scope)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.setups[appKey]; ok {
+		if existing.storageRoot != env.StorageRoot {
+			return fmt.Errorf("storage.sqlite: application %s/%s setup already owns storage root %q; refusing replacement with %q", appKey.applicationID, appKey.instanceID, existing.storageRoot, env.StorageRoot)
+		}
+		return nil
+	}
+	m.setups[appKey] = sqliteSetup{storageRoot: env.StorageRoot, logger: logger}
+	if isLegacyScope(scope) {
+		m.storageRoot = env.StorageRoot
+		m.logger = logger
+	}
+	if m.logger == nil {
+		m.logger = logger
+	}
+	logger.Info("storage.sqlite setup", "storage_root", env.StorageRoot, "application", appKey.applicationID, "instance", appKey.instanceID)
 	return nil
 }
 
-// teardown closes every open per-cell database. Safe to call more than
+func sqliteApplicationScopeKey(scope ext.Scope) sqliteApplicationKey {
+	return sqliteApplicationKey{applicationID: scope.ApplicationID(), instanceID: scope.ApplicationInstanceID()}
+}
+
+// teardown is the legacy, process-level cleanup path. It closes only legacy
 // once — closed handles are removed from the map.
 func teardown(_ context.Context) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
+	return manager.teardown()
+}
+
+// teardown is only used by legacy hosts. Pulp's legacy Teardown callback has
+// no application identity, so it cannot safely release scoped resources in a
+// multi-app process. Scoped hosts call teardownScope instead.
+func (m *sqliteManager) teardown() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var first error
-	for name, db := range manager.dbs {
+	for name, db := range m.dbs {
+		if !isLegacyScope(name.Scope()) {
+			continue
+		}
 		if err := db.Close(); err != nil && first == nil {
 			first = fmt.Errorf("close %s: %w", name, err)
 		}
-		delete(manager.dbs, name)
+		if slot, _, err := m.slots.GetOrCreate(name); err == nil {
+			slot.mu.Lock()
+			slot.db = nil
+			slot.mu.Unlock()
+		}
+		delete(m.dbs, name)
 	}
+	// A legacy Setup is one process-wide ownership lease. Once its Teardown
+	// runs, a later single-app host/test may legitimately claim a new root.
+	// Explicit application setup entries remain untouched.
+	delete(m.setups, sqliteApplicationScopeKey(ext.LegacyScope("default")))
+	m.storageRoot = ""
+	return first
+}
+
+// teardownScope closes all databases owned by one application placement. It
+// intentionally includes every cell instance under that placement and leaves
+// every other application's handles and setup root untouched.
+func teardownScope(_ context.Context, scope ext.Scope) error {
+	return manager.teardownScope(scope)
+}
+
+func (m *sqliteManager) teardownScope(scope ext.Scope) error {
+	if err := validateFilesystemScope(scope); err != nil {
+		return err
+	}
+	owner := sqliteApplicationScopeKey(scope)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var first error
+	for key, db := range m.dbs {
+		if sqliteApplicationScopeKey(key.Scope()) != owner {
+			continue
+		}
+		delete(m.dbs, key)
+		if slot, _, err := m.slots.GetOrCreate(key); err == nil {
+			slot.mu.Lock()
+			slot.db = nil
+			slot.mu.Unlock()
+		}
+		if err := db.Close(); err != nil && first == nil {
+			first = fmt.Errorf("close %s: %w", key, err)
+		}
+	}
+	delete(m.setups, owner)
 	return first
 }
 
 // teardownCell closes just one cell's database during a per-cell
 // control-socket shutdown, leaving other cells untouched.
 func teardownCell(_ context.Context, cellID string) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	db, ok := manager.dbs[cellID]
+	return manager.closeCellTarget(cellID)
+}
+
+// closeCellTarget accepts both the stable legacy cell name and a scoped
+// RoutingID supplied by modern Pulp runtimes. RoutingID is matched against
+// already-owned scopes rather than parsed, so a guest/control caller cannot
+// manufacture a scope that aliases another application's handle.
+func (m *sqliteManager) closeCellTarget(cellID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key, db := range m.dbs {
+		if !isLegacyScope(key.Scope()) && key.Scope().RoutingID() == cellID {
+			return m.closeKeyLocked(key, db)
+		}
+	}
+	key, err := sqliteKey(ext.LegacyScope(cellID))
+	if err != nil {
+		return err
+	}
+	db, ok := m.dbs[key]
 	if !ok {
 		return nil
 	}
-	delete(manager.dbs, cellID)
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", cellID, err)
+	return m.closeKeyLocked(key, db)
+}
+
+// closeScope releases exactly one application/cell instance database. It is
+// kept separate from TeardownCell so existing Pulp hosts retain their
+// cell-name-only shutdown behavior while scoped hosts can close precisely.
+func (m *sqliteManager) closeScope(scope ext.Scope) error {
+	key, err := sqliteKey(scope)
+	if err != nil {
+		return err
 	}
-	if manager.logger != nil {
-		manager.logger.Info("storage.sqlite teardown cell", "cell", cellID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	db, ok := m.dbs[key]
+	if !ok {
+		return nil
+	}
+	return m.closeKeyLocked(key, db)
+}
+
+func (m *sqliteManager) closeKeyLocked(key ext.ResourceKey, db *sql.DB) error {
+	delete(m.dbs, key)
+	if slot, _, err := m.slots.GetOrCreate(key); err == nil {
+		slot.mu.Lock()
+		slot.db = nil
+		slot.mu.Unlock()
+	}
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", key, err)
+	}
+	if logger := m.loggerForScopeLocked(key.Scope()); logger != nil {
+		logger.Info("storage.sqlite teardown scope", "scope", key)
 	}
 	return nil
 }
@@ -109,8 +265,24 @@ func teardownCell(_ context.Context, cellID string) error {
 // standard pragmas, and caches the handle. Idempotent — returns the
 // cached *sql.DB on subsequent calls.
 func (m *sqliteManager) openForCell(cellID string) (*sql.DB, error) {
+	return m.openForScope(ext.LegacyScope(cellID))
+}
+
+// openForScope opens the database owned by scope and caches it by the complete
+// application/cell-instance identity. Validation runs before any filesystem
+// operation, so malformed manifest values cannot traverse the storage root or
+// collide with another application's state.
+func (m *sqliteManager) openForScope(scope ext.Scope) (*sql.DB, error) {
+	key, err := sqliteKey(scope)
+	if err != nil {
+		return nil, err
+	}
+	slot, _, err := m.slots.GetOrCreate(key)
+	if err != nil {
+		return nil, fmt.Errorf("storage.sqlite: allocate scoped handle: %w", err)
+	}
 	m.mu.RLock()
-	if db, ok := m.dbs[cellID]; ok {
+	if db, ok := m.dbs[key]; ok {
 		m.mu.RUnlock()
 		return db, nil
 	}
@@ -119,13 +291,14 @@ func (m *sqliteManager) openForCell(cellID string) (*sql.DB, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Re-check under the write lock — another caller may have raced us.
-	if db, ok := m.dbs[cellID]; ok {
+	if db, ok := m.dbs[key]; ok {
 		return db, nil
 	}
-	if m.storageRoot == "" {
-		return nil, fmt.Errorf("storage.sqlite: setup not called before register")
+	storageRoot := m.storageRootForScopeLocked(scope)
+	dbPath, err := sqlitePath(storageRoot, scope)
+	if err != nil {
+		return nil, err
 	}
-	dbPath := filepath.Join(m.storageRoot, cellID, "data.db")
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create dir: %w", err)
 	}
@@ -156,17 +329,64 @@ func (m *sqliteManager) openForCell(cellID string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
-	m.dbs[cellID] = db
-	if m.logger != nil {
-		m.logger.Info("storage.sqlite ready", "cell", cellID, "path", dbPath)
+	m.dbs[key] = db
+	slot.mu.Lock()
+	slot.db = db
+	slot.mu.Unlock()
+	if logger := m.loggerForScopeLocked(scope); logger != nil {
+		logger.Info("storage.sqlite ready", "scope", key, "path", dbPath)
 	}
 	return db, nil
 }
 
+// storageRootForScopeLocked selects the immutable root captured by Setup for
+// this application placement. The legacy field is a compatibility fallback
+// for old hosts and direct package users that do not provide explicit scopes.
+// Caller must hold m.mu for reading or writing.
+func (m *sqliteManager) storageRootForScopeLocked(scope ext.Scope) string {
+	if setup, ok := m.setups[sqliteApplicationScopeKey(scope)]; ok {
+		return setup.storageRoot
+	}
+	return m.storageRoot
+}
+
+// loggerForScopeLocked mirrors storageRootForScopeLocked so concurrent app
+// setup cannot alter which logger observes a scoped database lifecycle.
+// Caller must hold m.mu for reading or writing.
+func (m *sqliteManager) loggerForScopeLocked(scope ext.Scope) *slog.Logger {
+	if setup, ok := m.setups[sqliteApplicationScopeKey(scope)]; ok {
+		return setup.logger
+	}
+	return m.logger
+}
+
+// openForSharedNamespace is the sole opt-in path for cross-application SQLite
+// state. Normal capability binding always uses openForScope, so same-named
+// cells stay isolated unless a host composition deliberately invokes this
+// declared shared-namespace policy.
+func (m *sqliteManager) openForSharedNamespace(scope ext.Scope, namespace string) (*sql.DB, error) {
+	shared, err := sharedScope(scope, namespace)
+	if err != nil {
+		return nil, err
+	}
+	return m.openForScope(shared)
+}
+
 func (m *sqliteManager) get(cellID string) (*sql.DB, bool) {
+	return m.getForScope(ext.LegacyScope(cellID))
+}
+
+// getForScope returns a handle only when the exact validated scope was opened.
+// Bound WASM imports capture this scope, so a guest has no runtime selector for
+// another application or cell instance.
+func (m *sqliteManager) getForScope(scope ext.Scope) (*sql.DB, bool) {
+	key, err := sqliteKey(scope)
+	if err != nil {
+		return nil, false
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	db, ok := m.dbs[cellID]
+	db, ok := m.dbs[key]
 	return db, ok
 }
 
@@ -185,17 +405,20 @@ type QueryResult struct {
 // ---- binding ---------------------------------------------------------------
 
 func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	scope, err := ext.ValidatedScopeOf(cell)
+	if err != nil {
+		return fmt.Errorf("storage.sqlite: resolve cell scope: %w", err)
+	}
 	// Open eagerly so a misconfigured storage root fails at cell load,
 	// not on the first query. Errors here abort cell registration.
-	if _, err := manager.openForCell(cellID); err != nil {
-		return fmt.Errorf("open sqlite for cell %q: %w", cellID, err)
+	if _, err := manager.openForScope(scope); err != nil {
+		return fmt.Errorf("open sqlite for scope %q: %w", scope.RoutingID(), err)
 	}
 	exec := func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
-		return sqliteExec(ctx, m, cellID, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut)
+		return sqliteExec(ctx, m, scope, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut)
 	}
 	query := func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut uint32) uint32 {
-		return sqliteQuery(ctx, m, cellID, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut)
+		return sqliteQuery(ctx, m, scope, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut)
 	}
 	b.NewFunctionBuilder().WithFunc(exec).Export("sqlite_exec")
 	b.NewFunctionBuilder().WithFunc(query).Export("sqlite_query")
@@ -211,7 +434,7 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 
 // ---- handlers --------------------------------------------------------------
 
-func sqliteExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
+func sqliteExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
 	if qLen == 0 {
 		return 1
 	}
@@ -223,7 +446,7 @@ func sqliteExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pP
 	if code != 0 {
 		return code
 	}
-	db, ok := manager.get(cellID)
+	db, ok := manager.getForScope(scope)
 	if !ok {
 		return 9
 	}
@@ -254,7 +477,7 @@ func sqliteExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pP
 	return writeResponse(ctx, m, encoded, resPtrOut, resLenOut)
 }
 
-func sqliteQuery(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut uint32) uint32 {
+func sqliteQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut uint32) uint32 {
 	if qLen == 0 {
 		return 1
 	}
@@ -266,7 +489,7 @@ func sqliteQuery(ctx context.Context, m api.Module, cellID string, qPtr, qLen, p
 	if code != 0 {
 		return code
 	}
-	db, ok := manager.get(cellID)
+	db, ok := manager.getForScope(scope)
 	if !ok {
 		return 9
 	}

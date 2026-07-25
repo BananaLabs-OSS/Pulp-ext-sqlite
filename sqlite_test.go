@@ -7,18 +7,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/BananaLabs-OSS/Pulp/ext"
+	"github.com/tetratelabs/wazero"
 )
 
 // newManager returns a fresh sqliteManager rooted at a temp storage dir so
 // tests never touch the package-global instance or each other's files.
 func newManager(t *testing.T) *sqliteManager {
 	t.Helper()
-	mgr := &sqliteManager{
-		dbs:         map[string]*sql.DB{},
-		storageRoot: t.TempDir(),
-		logger:      slog.Default(),
-	}
+	mgr := newSQLiteManager()
+	mgr.storageRoot = t.TempDir()
+	mgr.logger = slog.Default()
 	// Windows cannot RemoveAll a dir holding open files, and t.TempDir's
 	// cleanup runs before any test-registered cleanup. Close every db this
 	// manager opened FIRST so the temp dir teardown succeeds.
@@ -118,7 +120,7 @@ func TestOpenForCellIdempotent(t *testing.T) {
 // storage root was never captured (Setup not called), rather than writing
 // a data.db into the process CWD.
 func TestOpenForCellRequiresSetup(t *testing.T) {
-	mgr := &sqliteManager{dbs: map[string]*sql.DB{}} // no storageRoot
+	mgr := newSQLiteManager() // no storageRoot
 	if _, err := mgr.openForCell("alpha"); err == nil {
 		t.Fatal("openForCell with no storage root should fail, got nil")
 	}
@@ -261,7 +263,7 @@ func TestTeardownCellClosesOnlyThatCell(t *testing.T) {
 	}
 }
 
-// TestCellIDPathScoping documents the per-cell file location and the
+// TestCellIDPathScoping preserves the legacy per-cell path and rejects traversal.
 // AUDIT-flagged MEDIUM gap: unlike Pulp-ext-fs, openForCell does NOT
 // sanitize cellID before joining it into the storage path. With the
 // operator-authored manifest names that are the only real inputs today
@@ -311,6 +313,387 @@ func TestCellIDPathScoping(t *testing.T) {
 		// else: rejected and nothing created — good. Nothing to assert.
 	default:
 		t.Errorf("unexpected: openForCell(%q) succeeded but no file at %q", escapeID, escapedPath)
+	}
+}
+
+func newScope(t *testing.T, app, appInstance, cell, cellInstance string) ext.Scope {
+	t.Helper()
+	scope, err := ext.NewScope(app, appInstance, cell, cellInstance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scope
+}
+
+// TestApplicationCellInstanceIsolation proves a shared extension package gives
+// every application/cell placement its own SQLite handle and durable file.
+func TestApplicationCellInstanceIsolation(t *testing.T) {
+	mgr := newManager(t)
+	evolution := newScope(t, "evolution", "prod-a", "cart", "one")
+	sessions := newScope(t, "sessions", "prod-a", "cart", "one")
+	second := newScope(t, "sessions", "prod-a", "cart", "two")
+
+	dbEvolution, err := mgr.openForScope(evolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbSessions, err := mgr.openForScope(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbSecond, err := mgr.openForScope(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dbEvolution == dbSessions || dbSessions == dbSecond || dbEvolution == dbSecond {
+		t.Fatal("distinct application/cell scopes share a database handle")
+	}
+	if _, err := dbEvolution.Exec(`CREATE TABLE private_state (v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dbEvolution.Exec(`INSERT INTO private_state (v) VALUES ('evolution')`); err != nil {
+		t.Fatal(err)
+	}
+	for _, db := range []*sql.DB{dbSessions, dbSecond} {
+		if _, err := db.Query(`SELECT v FROM private_state`); err == nil {
+			t.Fatal("a separate application/cell scope read private state")
+		}
+	}
+	for _, scope := range []ext.Scope{evolution, sessions, second} {
+		path, err := sqlitePath(mgr.storageRoot, scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("scoped database missing at %q: %v", path, err)
+		}
+	}
+}
+
+type scopedTestCell struct {
+	name  string
+	scope ext.Scope
+}
+
+func (c scopedTestCell) Name() string     { return c.name }
+func (c scopedTestCell) Scope() ext.Scope { return c.scope }
+
+// TestBindActiveUsesPulpScope verifies the actual host-capability binding uses
+// ext.ValidatedScopeOf rather than falling back to the ambiguous cell name.
+func TestBindActiveUsesPulpScope(t *testing.T) {
+	saved := manager
+	t.Cleanup(func() { manager = saved })
+	manager = newManager(t)
+	scope := newScope(t, "sessions", "green", "player-manager", "two")
+	cell := scopedTestCell{name: "player-manager", scope: scope}
+	if err := setup(ext.SetupEnv{StorageRoot: manager.storageRoot, Logger: slog.Default()}); err != nil {
+		t.Fatal(err)
+	}
+	runtime := wazero.NewRuntime(context.Background())
+	t.Cleanup(func() { _ = runtime.Close(context.Background()) })
+	if err := bindActive(runtime.NewHostModuleBuilder("pulp"), cell); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.getForScope(scope); !ok {
+		t.Fatal("scoped binding did not open its exact Pulp scope")
+	}
+	if _, ok := manager.get(cell.Name()); ok {
+		t.Fatal("scoped binding incorrectly exposed a legacy cell-name database")
+	}
+}
+
+// TestExplicitSharedNamespace verifies cross-application state sharing cannot
+// happen accidentally: only an explicit matching namespace opens one handle.
+func TestExplicitSharedNamespace(t *testing.T) {
+	mgr := newManager(t)
+	evolution := newScope(t, "evolution", "prod-a", "catalog", "primary")
+	sessions := newScope(t, "sessions", "prod-b", "catalog", "primary")
+	isolated := newScope(t, "sessions", "prod-b", "catalog", "primary")
+
+	sharedLeft, err := mgr.openForSharedNamespace(evolution, "catalog-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedRight, err := mgr.openForSharedNamespace(sessions, "catalog-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	standalone, err := mgr.openForScope(isolated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sharedLeft != sharedRight {
+		t.Fatal("matching declared shared namespace did not reuse its handle")
+	}
+	if sharedLeft == standalone {
+		t.Fatal("ordinary scope shared state without an explicit namespace")
+	}
+	if _, err := sharedLeft.Exec(`CREATE TABLE declared_shared (v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sharedRight.Exec(`INSERT INTO declared_shared (v) VALUES ('ok')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := standalone.Query(`SELECT v FROM declared_shared`); err == nil {
+		t.Fatal("ordinary scope read explicitly shared namespace")
+	}
+}
+
+// TestApplicationLifecycleKeepsStorageNamespacesIsolated proves that repeated
+// host setup and teardown are owned by application scope, not whichever app
+// happened to initialize this process-global extension last. This is the
+// lifecycle counterpart to TestApplicationCellInstanceIsolation.
+func TestApplicationLifecycleKeepsStorageNamespacesIsolated(t *testing.T) {
+	mgr := newManager(t)
+	evolutionHost := newScope(t, "evolution", "blue", "host", "primary")
+	sessionsHost := newScope(t, "sessions", "green", "host", "primary")
+	evolutionRoot := filepath.Join(mgr.storageRoot, "evolution-storage", "blue")
+	sessionsRoot := filepath.Join(mgr.storageRoot, "sessions-storage", "green")
+	if err := mgr.setup(ext.SetupEnv{Scope: evolutionHost, StorageRoot: evolutionRoot, Logger: slog.Default()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.setup(ext.SetupEnv{Scope: sessionsHost, StorageRoot: sessionsRoot, Logger: slog.Default()}); err != nil {
+		t.Fatal(err)
+	}
+	// Repeating exactly the same setup is safe; changing an active app's
+	// storage namespace/root is rejected instead of silently overwriting it.
+	if err := mgr.setup(ext.SetupEnv{Scope: evolutionHost, StorageRoot: evolutionRoot}); err != nil {
+		t.Fatalf("idempotent evolution setup: %v", err)
+	}
+	if err := mgr.setup(ext.SetupEnv{Scope: evolutionHost, StorageRoot: filepath.Join(mgr.storageRoot, "wrong-root")}); err == nil {
+		t.Fatal("setup replaced a live application's storage root")
+	}
+
+	evolutionCell := newScope(t, "evolution", "blue", "cart", "primary")
+	sessionsCell := newScope(t, "sessions", "green", "cart", "primary")
+	dbEvolution, err := mgr.openForScope(evolutionCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbSessions, err := mgr.openForScope(sessionsCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathEvolution, err := sqlitePath(evolutionRoot, evolutionCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathSessions, err := sqlitePath(sessionsRoot, sessionsCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pathEvolution); err != nil {
+		t.Fatalf("evolution storage namespace was not honored at %q: %v", pathEvolution, err)
+	}
+	if _, err := os.Stat(pathSessions); err != nil {
+		t.Fatalf("sessions storage namespace was not honored at %q: %v", pathSessions, err)
+	}
+	if strings.HasPrefix(pathEvolution, sessionsRoot) || strings.HasPrefix(pathSessions, evolutionRoot) {
+		t.Fatal("application storage namespaces overlap")
+	}
+
+	// Legacy Teardown has no scope. It must not close either scoped handle
+	// when one hosted application stops.
+	if err := mgr.teardown(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbEvolution.Ping(); err != nil {
+		t.Fatalf("ambiguous legacy teardown closed Evolution: %v", err)
+	}
+	if err := dbSessions.Ping(); err != nil {
+		t.Fatalf("ambiguous legacy teardown closed Sessions: %v", err)
+	}
+
+	if err := mgr.teardownScope(evolutionHost); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbEvolution.Ping(); err == nil {
+		t.Fatal("Evolution handle remained open after its scoped teardown")
+	}
+	if err := dbSessions.Ping(); err != nil {
+		t.Fatalf("Evolution teardown interrupted Sessions: %v", err)
+	}
+	// A restarted Evolution instance gets the same durable storage namespace.
+	if err := mgr.setup(ext.SetupEnv{Scope: evolutionHost, StorageRoot: evolutionRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.openForScope(evolutionCell); err != nil {
+		t.Fatalf("reopen Evolution after scoped teardown: %v", err)
+	}
+}
+
+// TestLegacyTeardownStillClosesLegacyDatabase preserves the original
+// single-application lifecycle while proving its compatibility fallback does
+// not reach into an explicitly scoped application.
+func TestLegacyTeardownStillClosesLegacyDatabase(t *testing.T) {
+	mgr := newManager(t)
+	legacyRoot := mgr.storageRoot
+	if err := mgr.setup(ext.SetupEnv{StorageRoot: legacyRoot}); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := mgr.openForCell("legacy-cart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := newScope(t, "sessions", "green", "host", "primary")
+	scopedRoot := filepath.Join(mgr.storageRoot, "sessions-storage", "green")
+	if err := mgr.setup(ext.SetupEnv{Scope: host, StorageRoot: scopedRoot}); err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := mgr.openForScope(newScope(t, "sessions", "green", "cart", "primary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.teardown(); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Ping(); err == nil {
+		t.Fatal("legacy teardown did not close legacy database")
+	}
+	if err := scoped.Ping(); err != nil {
+		t.Fatalf("legacy teardown closed scoped database: %v", err)
+	}
+	// Teardown releases the legacy setup lease, so the next sequential
+	// single-app host can claim a different temp/root. The live scoped setup
+	// remains protected from replacement.
+	if err := mgr.setup(ext.SetupEnv{StorageRoot: filepath.Join(t.TempDir(), "legacy-restarted")}); err != nil {
+		t.Fatalf("legacy setup lease survived teardown: %v", err)
+	}
+	if err := mgr.setup(ext.SetupEnv{Scope: host, StorageRoot: filepath.Join(t.TempDir(), "wrong-sessions-root")}); err == nil {
+		t.Fatal("legacy teardown released a live scoped setup lease")
+	}
+}
+
+// TestTwoApplicationLifecycleRace exercises the real failure mode behind the
+// scoped registry: one application can be repeatedly restarted while a second
+// shares the extension implementation. The race detector protects the maps;
+// the assertions prove teardown never closes the other application's DB.
+func TestTwoApplicationLifecycleRace(t *testing.T) {
+	mgr := newManager(t)
+	alphaHost := newScope(t, "evolution", "alpha", "host", "primary")
+	betaHost := newScope(t, "sessions", "beta", "host", "primary")
+	alphaRoot := filepath.Join(mgr.storageRoot, "evolution-storage", "alpha")
+	betaRoot := filepath.Join(mgr.storageRoot, "sessions-storage", "beta")
+	alphaCell := newScope(t, "evolution", "alpha", "storage", "primary")
+	betaCell := newScope(t, "sessions", "beta", "storage", "primary")
+	if err := mgr.setup(ext.SetupEnv{Scope: alphaHost, StorageRoot: alphaRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.setup(ext.SetupEnv{Scope: betaHost, StorageRoot: betaRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.openForScope(betaCell); err != nil {
+		t.Fatal(err)
+	}
+
+	const rounds = 40
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for range rounds {
+			if err := mgr.setup(ext.SetupEnv{Scope: alphaHost, StorageRoot: alphaRoot}); err != nil {
+				errCh <- err
+				return
+			}
+			if _, err := mgr.openForScope(alphaCell); err != nil {
+				errCh <- err
+				return
+			}
+			if err := mgr.teardownScope(alphaHost); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for range rounds {
+			if err := mgr.setup(ext.SetupEnv{Scope: betaHost, StorageRoot: betaRoot}); err != nil {
+				errCh <- err
+				return
+			}
+			db, err := mgr.openForScope(betaCell)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if err := db.Ping(); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if db, ok := mgr.getForScope(betaCell); !ok || db.Ping() != nil {
+		t.Fatal("alpha lifecycle closed or removed beta's database")
+	}
+}
+
+// TestScopedRestart proves a restarted instance reopens its own durable state
+// without disturbing another instance of the same cell package.
+func TestScopedRestart(t *testing.T) {
+	mgr := newManager(t)
+	primary := newScope(t, "sessions", "prod-a", "player-manager", "one")
+	sibling := newScope(t, "sessions", "prod-a", "player-manager", "two")
+	dbPrimary, err := mgr.openForScope(primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbSibling, err := mgr.openForScope(sibling)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dbPrimary.Exec(`CREATE TABLE state (v TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dbPrimary.Exec(`INSERT INTO state (v) VALUES ('survives')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.closeScope(primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbPrimary.Ping(); err == nil {
+		t.Fatal("closed primary handle remains usable")
+	}
+	if err := dbSibling.Ping(); err != nil {
+		t.Fatalf("sibling interrupted by primary restart: %v", err)
+	}
+	restarted, err := mgr.openForScope(primary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted == dbPrimary {
+		t.Fatal("restart reused its closed handle")
+	}
+	var got string
+	if err := restarted.QueryRow(`SELECT v FROM state`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != "survives" {
+		t.Fatalf("restart lost durable state: %q", got)
+	}
+}
+
+func TestScopedPathRejectsTraversal(t *testing.T) {
+	mgr := newManager(t)
+	for _, parts := range [][4]string{
+		{"../evolution", "prod", "cart", "one"},
+		{"evolution", "prod", "../cart", "one"},
+		{"evolution", "prod", "cart", ".."},
+	} {
+		scope, err := ext.NewScope(parts[0], parts[1], parts[2], parts[3])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mgr.openForScope(scope); err == nil {
+			t.Fatalf("openForScope(%q) accepted traversal", scope.RoutingID())
+		}
 	}
 }
 
