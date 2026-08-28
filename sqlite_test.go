@@ -14,6 +14,26 @@ import (
 	"github.com/tetratelabs/wazero"
 )
 
+func TestIsWSLDrvFSStorageFor(t *testing.T) {
+	tests := []struct {
+		name, goos, release, root string
+		want                      bool
+	}{
+		{"native windows is not DrvFS", "windows", "", `C:\\state`, false},
+		{"native linux is not DrvFS", "linux", "6.8.0-generic", "/var/lib/lexicon", false},
+		{"wsl native filesystem is not DrvFS", "linux", "6.6.87.2-microsoft-standard-WSL2", "/home/user/state", false},
+		{"wsl default DrvFS is rejected", "linux", "6.6.87.2-microsoft-standard-WSL2", "/mnt/c/dev/projects-knowledge-state", true},
+		{"non-wsl mount is not DrvFS", "linux", "6.8.0-generic", "/mnt/c/dev/projects-knowledge-state", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isWSLDrvFSStorageFor(tt.goos, tt.release, tt.root); got != tt.want {
+				t.Fatalf("isWSLDrvFSStorageFor(%q, %q, %q) = %t, want %t", tt.goos, tt.release, tt.root, got, tt.want)
+			}
+		})
+	}
+}
+
 // newManager returns a fresh sqliteManager rooted at a temp storage dir so
 // tests never touch the package-global instance or each other's files.
 func newManager(t *testing.T) *sqliteManager {
