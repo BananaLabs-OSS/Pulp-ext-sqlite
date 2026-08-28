@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -36,9 +37,11 @@ import (
 // empty there — see Pulp run.Main) so the DBs are opened lazily on
 // first Register with the manifest's cell name baked in.
 type sqliteManager struct {
-	mu    sync.RWMutex
-	dbs   map[ext.ResourceKey]*sql.DB
-	slots *ext.ScopedFactory[*sqliteSlot]
+	mu           sync.RWMutex
+	dbs          map[ext.ResourceKey]*sql.DB
+	sharedUses   map[ext.ResourceKey]int
+	sharedOwners map[sqliteApplicationKey]map[ext.ResourceKey]bool
+	slots        *ext.ScopedFactory[*sqliteSlot]
 	// setups is keyed by application placement, rather than being process
 	// global. One host loads this extension for every application it
 	// supervises, so a later Setup must never redirect an already-bound cell.
@@ -53,8 +56,9 @@ type sqliteApplicationKey struct {
 }
 
 type sqliteSetup struct {
-	storageRoot string
-	logger      *slog.Logger
+	storageRoot       string
+	storageNamespaces map[string]string
+	logger            *slog.Logger
 }
 
 // sqliteSlot is retained by ext.ScopedFactory for one ResourceKey. Closing a
@@ -67,8 +71,10 @@ type sqliteSlot struct {
 
 func newSQLiteManager() *sqliteManager {
 	return &sqliteManager{
-		dbs:    map[ext.ResourceKey]*sql.DB{},
-		setups: map[sqliteApplicationKey]sqliteSetup{},
+		dbs:          map[ext.ResourceKey]*sql.DB{},
+		sharedUses:   map[ext.ResourceKey]int{},
+		sharedOwners: map[sqliteApplicationKey]map[ext.ResourceKey]bool{},
+		setups:       map[sqliteApplicationKey]sqliteSetup{},
 		slots: ext.NewScopedFactory(func(ext.ResourceKey) (*sqliteSlot, error) {
 			return &sqliteSlot{}, nil
 		}),
@@ -115,7 +121,7 @@ func (m *sqliteManager) setup(env ext.SetupEnv) error {
 		}
 		return nil
 	}
-	m.setups[appKey] = sqliteSetup{storageRoot: env.StorageRoot, logger: logger}
+	m.setups[appKey] = sqliteSetup{storageRoot: env.StorageRoot, storageNamespaces: cloneNamespaces(env.StorageNamespaces), logger: logger}
 	if isLegacyScope(scope) {
 		m.storageRoot = env.StorageRoot
 		m.logger = logger
@@ -180,6 +186,7 @@ func (m *sqliteManager) teardownScope(scope ext.Scope) error {
 	owner := sqliteApplicationScopeKey(scope)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	setup := m.setups[owner]
 	var first error
 	for key, db := range m.dbs {
 		if sqliteApplicationScopeKey(key.Scope()) != owner {
@@ -195,6 +202,30 @@ func (m *sqliteManager) teardownScope(scope ext.Scope) error {
 			first = fmt.Errorf("close %s: %w", key, err)
 		}
 	}
+	for _, namespace := range setup.storageNamespaces {
+		shared, err := sharedScope(scope, namespace)
+		if err != nil {
+			continue
+		}
+		key, err := sqliteKey(shared)
+		if err != nil {
+			continue
+		}
+		if !m.sharedOwners[owner][key] {
+			continue
+		}
+		if m.sharedUses[key] > 1 {
+			m.sharedUses[key]--
+			continue
+		}
+		delete(m.sharedUses, key)
+		if db, ok := m.dbs[key]; ok {
+			if err := m.closeKeyLocked(key, db); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	delete(m.sharedOwners, owner)
 	delete(m.setups, owner)
 	return first
 }
@@ -295,6 +326,9 @@ func (m *sqliteManager) openForScope(scope ext.Scope) (*sql.DB, error) {
 		return db, nil
 	}
 	storageRoot := m.storageRootForScopeLocked(scope)
+	if err := rejectWSLDrvFSStorage(storageRoot); err != nil {
+		return nil, err
+	}
 	dbPath, err := sqlitePath(storageRoot, scope)
 	if err != nil {
 		return nil, err
@@ -339,6 +373,32 @@ func (m *sqliteManager) openForScope(scope ext.Scope) (*sql.DB, error) {
 	return db, nil
 }
 
+// rejectWSLDrvFSStorage prevents a Linux Lexicon process from treating a
+// Windows-mounted directory as shared SQLite storage. DrvFS is a 9p bridge and
+// cannot provide SQLite's WAL sidecar/locking guarantees across Windows and
+// WSL. Switching journal modes is not a safe repair for an existing canonical
+// database. Use one SQLite owner behind a broker, or a client/server store.
+func rejectWSLDrvFSStorage(storageRoot string) error {
+	release, _ := os.ReadFile("/proc/sys/kernel/osrelease")
+	if isWSLDrvFSStorageFor(runtime.GOOS, string(release), storageRoot) {
+		return fmt.Errorf("storage.sqlite: direct SQLite storage at %q is a Windows-mounted WSL DrvFS path; sharing canonical SQLite files between Windows and WSL is unsupported (use a single-owner Lexicon broker or client/server store)", storageRoot)
+	}
+	return nil
+}
+
+func isWSLDrvFSStorageFor(goos, kernelRelease, storageRoot string) bool {
+	if goos != "linux" || !strings.Contains(strings.ToLower(kernelRelease), "microsoft") {
+		return false
+	}
+	root := filepath.ToSlash(filepath.Clean(storageRoot))
+	parts := strings.Split(strings.TrimPrefix(root, "/"), "/")
+	if len(parts) >= 2 && parts[0] == "mnt" && len(parts[1]) == 1 &&
+		parts[1][0] >= 'a' && parts[1][0] <= 'z' {
+		return true
+	}
+	return false
+}
+
 // storageRootForScopeLocked selects the immutable root captured by Setup for
 // this application placement. The legacy field is a compatibility fallback
 // for old hosts and direct package users that do not provide explicit scopes.
@@ -369,7 +429,66 @@ func (m *sqliteManager) openForSharedNamespace(scope ext.Scope, namespace string
 	if err != nil {
 		return nil, err
 	}
-	return m.openForScope(shared)
+	m.mu.RLock()
+	root := m.storageRootForScopeLocked(scope)
+	m.mu.RUnlock()
+	return m.openForScopeAtRoot(shared, root)
+}
+
+func (m *sqliteManager) openForScopeAtRoot(scope ext.Scope, storageRoot string) (*sql.DB, error) {
+	key, err := sqliteKey(scope)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if existing, ok := m.dbs[key]; ok {
+		m.mu.Unlock()
+		return existing, nil
+	}
+	if _, ok := m.setups[sqliteApplicationScopeKey(scope)]; !ok {
+		m.setups[sqliteApplicationScopeKey(scope)] = sqliteSetup{storageRoot: storageRoot, logger: slog.Default()}
+	}
+	m.mu.Unlock()
+	return m.openForScope(scope)
+}
+
+func (m *sqliteManager) sharedNamespaceForScope(scope ext.Scope) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if setup, ok := m.setups[sqliteApplicationScopeKey(scope)]; ok {
+		return setup.storageNamespaces[scope.CellID()]
+	}
+	return ""
+}
+
+func (m *sqliteManager) retainShared(owner ext.Scope, shared ext.Scope) {
+	key, err := sqliteKey(shared)
+	if err != nil {
+		return
+	}
+	app := sqliteApplicationScopeKey(owner)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	owners := m.sharedOwners[app]
+	if owners == nil {
+		owners = map[ext.ResourceKey]bool{}
+		m.sharedOwners[app] = owners
+	}
+	if !owners[key] {
+		owners[key] = true
+		m.sharedUses[key]++
+	}
+}
+
+func cloneNamespaces(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for cell, namespace := range in {
+		out[cell] = namespace
+	}
+	return out
 }
 
 func (m *sqliteManager) get(cellID string) (*sql.DB, bool) {
@@ -411,7 +530,13 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	}
 	// Open eagerly so a misconfigured storage root fails at cell load,
 	// not on the first query. Errors here abort cell registration.
-	if _, err := manager.openForScope(scope); err != nil {
+	if namespace := manager.sharedNamespaceForScope(scope); namespace != "" {
+		if _, err := manager.openForSharedNamespace(scope, namespace); err != nil {
+			return fmt.Errorf("open sqlite for scope %q: %w", scope.RoutingID(), err)
+		}
+		shared, _ := sharedScope(scope, namespace)
+		manager.retainShared(scope, shared)
+	} else if _, err := manager.openForScope(scope); err != nil {
 		return fmt.Errorf("open sqlite for scope %q: %w", scope.RoutingID(), err)
 	}
 	exec := func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
@@ -446,7 +571,11 @@ func sqliteExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, 
 	if code != 0 {
 		return code
 	}
-	db, ok := manager.getForScope(scope)
+	activeScope := scope
+	if namespace := manager.sharedNamespaceForScope(scope); namespace != "" {
+		activeScope, _ = sharedScope(scope, namespace)
+	}
+	db, ok := manager.getForScope(activeScope)
 	if !ok {
 		return 9
 	}
@@ -489,7 +618,11 @@ func sqliteQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen,
 	if code != 0 {
 		return code
 	}
-	db, ok := manager.getForScope(scope)
+	activeScope := scope
+	if namespace := manager.sharedNamespaceForScope(scope); namespace != "" {
+		activeScope, _ = sharedScope(scope, namespace)
+	}
+	db, ok := manager.getForScope(activeScope)
 	if !ok {
 		return 9
 	}
