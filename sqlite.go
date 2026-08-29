@@ -18,6 +18,7 @@ package sqliteext
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -637,7 +638,7 @@ func sqliteQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen,
 	}
 	rows, err := db.QueryContext(ctx, string(q), args...)
 	if err != nil {
-		return writeQueryError(ctx, m, err, rowsPtrOut, rowsLenOut)
+		return writeQueryError(ctx, m, errors.New(sqliteStatementError(err, q)), rowsPtrOut, rowsLenOut)
 	}
 	defer rows.Close()
 
