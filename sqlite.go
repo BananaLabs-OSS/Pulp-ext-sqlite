@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -522,6 +523,20 @@ type QueryResult struct {
 	Error   string   `msgpack:"error,omitempty"`
 }
 
+var bunMigrationInsert = regexp.MustCompile(`(?is)^INSERT INTO bun_migrations \("id", "name", "group_id", "migrated_at"\) VALUES \(DEFAULT, (.+), (.+), DEFAULT\) RETURNING "id", "migrated_at"$`)
+
+func normalizeSQLiteQuery(query string) string {
+	// SQLite permits DEFAULT VALUES, but unlike PostgreSQL it does not permit
+	// DEFAULT as an individual VALUES expression. Bun's migration recorder
+	// emits the latter for its auto-id and migrated-at columns even under its
+	// SQLite dialect. Omitting those two columns applies the same declared
+	// defaults using valid SQLite syntax.
+	if match := bunMigrationInsert.FindStringSubmatch(query); match != nil {
+		return `INSERT INTO bun_migrations ("name", "group_id") VALUES (` + match[1] + `, ` + match[2] + `) RETURNING "id", "migrated_at"`
+	}
+	return query
+}
+
 // ---- binding ---------------------------------------------------------------
 
 func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
@@ -580,7 +595,8 @@ func sqliteExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, 
 	if !ok {
 		return 9
 	}
-	res, err := db.ExecContext(ctx, string(q), args...)
+	query := normalizeSQLiteQuery(string(q))
+	res, err := db.ExecContext(ctx, query, args...)
 	if err != nil {
 		encoded, mErr := msgpack.Marshal(ExecResult{Error: sqliteStatementError(err, q)})
 		if mErr != nil {
@@ -636,7 +652,8 @@ func sqliteQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen,
 	if !ok {
 		return 9
 	}
-	rows, err := db.QueryContext(ctx, string(q), args...)
+	query := normalizeSQLiteQuery(string(q))
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return writeQueryError(ctx, m, errors.New(sqliteStatementError(err, q)), rowsPtrOut, rowsLenOut)
 	}
