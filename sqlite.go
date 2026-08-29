@@ -581,7 +581,7 @@ func sqliteExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, 
 	}
 	res, err := db.ExecContext(ctx, string(q), args...)
 	if err != nil {
-		encoded, mErr := msgpack.Marshal(ExecResult{Error: err.Error()})
+		encoded, mErr := msgpack.Marshal(ExecResult{Error: sqliteStatementError(err, q)})
 		if mErr != nil {
 			return 5
 		}
@@ -604,6 +604,15 @@ func sqliteExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, 
 		return 5
 	}
 	return writeResponse(ctx, m, encoded, resPtrOut, resLenOut)
+}
+
+func sqliteStatementError(err error, query []byte) string {
+	const limit = 512
+	statement := string(query)
+	if len(statement) > limit {
+		statement = statement[:limit] + "..."
+	}
+	return fmt.Sprintf("%v [sql=%q]", err, statement)
 }
 
 func sqliteQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut uint32) uint32 {
